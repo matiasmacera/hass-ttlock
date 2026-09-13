@@ -269,6 +269,10 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         # persisted, so it naturally resets to False on every restart.
         self._sensor_recheck_done = False
 
+        # The pending "assume auto-locked" timer started by the last unlock, if
+        # any - kept so a newer unlock (or unload) can cancel it.
+        self._auto_lock_task: asyncio.Task | None = None
+
         # Slow-tier cadence and its per-call "last fetched" gates. Only lock
         # state is re-verified every poll; detail/passage/gateway fetches run
         # at most once per _slow_interval (see _async_update_data). Timestamps
@@ -665,6 +669,7 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
 
         new_data = deepcopy(self.data)
         new_data.battery_level = event.battery_level
+        reverify = False
 
         if state := event.state:
             if state.locked == State.locked:
@@ -682,14 +687,43 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
                 new_data.sensor.opened = True
             if event.sensorState.opened == SensorState.closed:
                 new_data.sensor.opened = False
-                new_data.locked = True
-                new_data.last_reason = "Door Closed"
-
-                _LOGGER.debug("Assuming auto-locked via sensor")
+                # A closed door says nothing about the bolt. A pending
+                # auto-lock timer already covers the unlocked case; otherwise
+                # ask the lock rather than assume. A lock nothing can reach
+                # keeps its last known state - refreshing it would only mark
+                # it unavailable.
+                reverify = (
+                    new_data.locked is not True
+                    and not self._auto_lock_pending
+                    and self.connectable
+                )
         self.async_set_updated_data(new_data)
+
+        if reverify:
+            # scheduled after the update above, so it can't clobber the result
+            _LOGGER.debug("Door closed, re-verifying lock state")
+            self.hass.async_create_task(self.async_request_refresh(), eager_start=False)
+
+    @property
+    def _auto_lock_pending(self) -> bool:
+        return self._auto_lock_task is not None and not self._auto_lock_task.done()
+
+    @callback
+    def _cancel_auto_lock(self) -> None:
+        if self._auto_lock_task is not None:
+            self._auto_lock_task.cancel()
+            self._auto_lock_task = None
+
+    async def async_shutdown(self) -> None:
+        """Cancel any pending auto-lock timer along with scheduled refreshes."""
+        self._cancel_auto_lock()
+        await super().async_shutdown()
 
     def _handle_auto_lock(self, lock_ts: datetime, server_ts: datetime):
         """Handle auto-locking the lock."""
+
+        # a newer unlock restarts the lock's auto-lock countdown
+        self._cancel_auto_lock()
 
         auto_lock_delay = self.data.auto_lock_delay(lock_ts)
         computed_msg_delay = max(0, (server_ts - lock_ts).total_seconds())
@@ -710,7 +744,9 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
             _LOGGER.debug("Assuming lock auto locked after %s seconds", auto_lock_delay)
             self.async_set_updated_data(new_data)
 
-        self.hass.create_task(_auto_locked(auto_lock_delay, computed_msg_delay))
+        self._auto_lock_task = self.hass.async_create_task(
+            _auto_locked(auto_lock_delay, computed_msg_delay), eager_start=False
+        )
 
     @property
     def unique_id(self) -> str:

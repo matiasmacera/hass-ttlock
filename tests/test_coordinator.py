@@ -1022,8 +1022,8 @@ class TestLockUpdateCoordinator:
             assert coordinator.data.sensor is not None
             assert coordinator.data.sensor.opened is True
 
-        async def test_close_works(
-            self, coordinator: LockUpdateCoordinator, mock_api_responses
+        async def test_close_does_not_assume_locked(
+            self, hass, coordinator: LockUpdateCoordinator, mock_api_responses
         ):
             mock_api_responses("with_sensor")
             await coordinator.async_refresh()
@@ -1036,10 +1036,117 @@ class TestLockUpdateCoordinator:
             event = WebhookEvent.model_validate(WEBHOOK_SENSOR_CLOSE)
             coordinator._process_webhook_data(event)
 
-            assert coordinator.data.locked is True
+            # a closed door says nothing about the bolt
+            assert coordinator.data.locked is False
             assert coordinator.data.sensor is not None
             assert coordinator.data.sensor.opened is False
-            assert coordinator.data.last_reason == "Door Closed"
+
+            # the lock still reports unlocked when asked
+            await hass.async_block_till_done()
+            assert coordinator.data.locked is False
+
+        async def test_close_reverifies_lock_state(
+            self,
+            hass,
+            coordinator: LockUpdateCoordinator,
+            mock_api_responses,
+            monkeypatch,
+        ):
+            mock_api_responses("with_sensor")
+            await coordinator.async_refresh()
+
+            coordinator.data.locked = False
+            coordinator.data.auto_lock_seconds = -1
+            assert coordinator.data.sensor is not None
+            coordinator.data.sensor.opened = True
+
+            # the lock locked itself when the door closed
+            get_lock_state = AsyncMock(
+                return_value=WireLockState.model_validate(LOCK_STATE_LOCKED)
+            )
+            monkeypatch.setattr(coordinator.api, "get_lock_state", get_lock_state)
+
+            event = WebhookEvent.model_validate(WEBHOOK_SENSOR_CLOSE)
+            coordinator._process_webhook_data(event)
+            await hass.async_block_till_done()
+
+            get_lock_state.assert_awaited_once()
+            assert coordinator.data.locked is True
+
+        async def test_close_on_unreachable_lock_keeps_last_known_state(
+            self, hass, api
+        ):
+            config_entry = MockConfigEntry(domain=DOMAIN)
+            config_entry.add_to_hass(hass)
+            summary = LockSummary(
+                lockId=1,
+                lockAlias="No Gateway",
+                lockMac="00:00:00:00:00:01",
+                hasGateway=0,
+            )
+            coordinator = LockUpdateCoordinator(
+                hass,
+                config_entry,
+                api,
+                summary,
+                LockTrafficCapture(),
+                LockStateStore(hass),
+            )
+            assert coordinator.connectable is False
+            coordinator.data.locked = False
+            coordinator.data.sensor = SensorData(opened=True, battery=90)
+
+            event = WebhookEvent.model_validate({**WEBHOOK_SENSOR_CLOSE, "lockId": 1})
+            coordinator._process_webhook_data(event)
+            await hass.async_block_till_done()
+
+            assert coordinator.data.locked is False
+            assert coordinator.data.sensor.opened is False
+            # no refresh was attempted, so the lock isn't marked unavailable
+            assert coordinator.last_update_success is True
+
+        async def test_second_unlock_restarts_auto_lock_timer(
+            self, coordinator: LockUpdateCoordinator, mock_api_responses
+        ):
+            mock_api_responses("default")
+            await coordinator.async_refresh()
+            coordinator.data.locked = True
+            coordinator.data.auto_lock_seconds = 2
+            coordinator.data.passage_mode_config = None
+
+            event = WebhookEvent.model_validate(WEBHOOK_UNLOCK_10AM_UTC)
+
+            coordinator._process_webhook_data(event)
+            await asyncio.sleep(1)
+            assert coordinator.data.locked is False
+
+            # unlocked again before the first timer ran out
+            coordinator._process_webhook_data(event)
+            await asyncio.sleep(1.5)
+
+            # the first unlock's timer would have fired by now
+            assert coordinator.data.locked is False
+
+            await asyncio.sleep(1)
+            assert coordinator.data.locked is True
+            assert coordinator.data.last_reason == "Auto Lock"
+
+        async def test_shutdown_cancels_pending_auto_lock(
+            self, coordinator: LockUpdateCoordinator, mock_api_responses
+        ):
+            mock_api_responses("default")
+            await coordinator.async_refresh()
+            coordinator.data.locked = True
+            coordinator.data.auto_lock_seconds = 1
+            coordinator.data.passage_mode_config = None
+
+            event = WebhookEvent.model_validate(WEBHOOK_UNLOCK_10AM_UTC)
+            coordinator._process_webhook_data(event)
+
+            await coordinator.async_shutdown()
+            await asyncio.sleep(1.5)
+
+            assert coordinator.data.locked is False
 
         async def test_ignores_events_for_other_locks(
             self, coordinator: LockUpdateCoordinator, mock_api_responses
