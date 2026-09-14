@@ -669,11 +669,12 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
 
         new_data = deepcopy(self.data)
         new_data.battery_level = event.battery_level
-        reverify = False
 
         if state := event.state:
             if state.locked == State.locked:
                 new_data.locked = True
+                # the countdown is over - an old timer must not outlive a lock
+                self._cancel_auto_lock()
             elif state.locked == State.unlocked:
                 new_data.locked = False
                 self._handle_auto_lock(event.lock_ts, event.server_ts)
@@ -687,26 +688,10 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
                 new_data.sensor.opened = True
             if event.sensorState.opened == SensorState.closed:
                 new_data.sensor.opened = False
-                # A closed door says nothing about the bolt. A pending
-                # auto-lock timer already covers the unlocked case; otherwise
-                # ask the lock rather than assume. A lock nothing can reach
-                # keeps its last known state - refreshing it would only mark
-                # it unavailable.
-                reverify = (
-                    new_data.locked is not True
-                    and not self._auto_lock_pending
-                    and self.connectable
-                )
+                # A closed door says nothing about the bolt: keep the last
+                # known state. A pending auto-lock timer still covers the
+                # unlocked case, and the next poll or lock event corrects it.
         self.async_set_updated_data(new_data)
-
-        if reverify:
-            # scheduled after the update above, so it can't clobber the result
-            _LOGGER.debug("Door closed, re-verifying lock state")
-            self.hass.async_create_task(self.async_request_refresh(), eager_start=False)
-
-    @property
-    def _auto_lock_pending(self) -> bool:
-        return self._auto_lock_task is not None and not self._auto_lock_task.done()
 
     @callback
     def _cancel_auto_lock(self) -> None:
@@ -833,6 +818,9 @@ class LockUpdateCoordinator(DataUpdateCoordinator[LockState]):
         res = await self.api.set_auto_lock(self.lock_id, seconds)
         if res:
             self.data.auto_lock_seconds = seconds
+            if not on:
+                # a countdown started under the old setting no longer applies
+                self._cancel_auto_lock()
             self.async_update_listeners()
 
     async def set_lock_sound(self, on: bool) -> None:
